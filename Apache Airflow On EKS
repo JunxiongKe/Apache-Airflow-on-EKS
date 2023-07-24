@@ -1,0 +1,687 @@
+Apache Airflow On EKS
+一、安装前置说明
+1）EKS集群安装可参考：https://github.com/xufanglin/eks-quickstart
+2）EKS服务K8s版本是1.25、Apche Airflow DAG及LOG文件存储在Amazon EFS、 Apche Airflow元数据持久化存储在RDS Postgres。DAG文件利用EFS服务，当把文件系统挂载到一台ETL服务器上，可以把Airflow配置Python文件放在这台ETL服务器对应挂载目录下。
+3）Apche Airflow 2.6.1，采用yaml方式安装、Apache Airflow的excutor是KubernetesExecutor
+5）集群的弹性管理使用Karpenter v0.28
+二、基础环境准备
+初始化变量
+AOK_AWS_REGION=ap-southeast-1
+AOK_ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+AOK_EKS_CLUSTER_NAME=EKSdemo
+安装EFS CSI
+printf "Deploying EFS Driver...\n"
+helm repo add aws-efs-csi-driver https://kubernetes-sigs.github.io/aws-efs-csi-driver/
+helm repo update
+helm upgrade --install aws-efs-csi-driver \
+  aws-efs-csi-driver/aws-efs-csi-driver \
+  --namespace kube-system
+
+printf "Getting the VPC of the EKS cluster and its CIDR block...\n"
+export AOK_VPC_ID=$(aws eks describe-cluster --name $AOK_EKS_CLUSTER_NAME \
+  --region $AOK_AWS_REGION \
+  --query "cluster.resourcesVpcConfig.vpcId" \
+  --output text)
+  
+export AOK_CIDR_BLOCK=$(aws ec2 describe-vpcs --vpc-ids $AOK_VPC_ID \
+  --query "Vpcs[].CidrBlock" \
+  --region $AOK_AWS_REGION \
+  --output text)
+
+printf "Creating a security group for EFS, and allow inbound NFS traffic (port 2049):...\n"
+export AOK_EFS_SG_ID=$(aws ec2 create-security-group \
+  --region $AOK_AWS_REGION \
+  --description Airflow-on-EKS \
+  --group-name Airflow-on-EKS \
+  --vpc-id $AOK_VPC_ID \
+  --query 'GroupId' \
+  --output text)
+  
+aws ec2 authorize-security-group-ingress \
+  --group-id $AOK_EFS_SG_ID \
+  --protocol tcp \
+  --port 2049 \
+  --cidr $AOK_CIDR_BLOCK \
+  --region $AOK_AWS_REGION
+
+printf "Creating an EFS file system...\n"
+export AOK_EFS_FS_ID=$(aws efs create-file-system \
+  --creation-token Airflow-on-EKS \
+  --performance-mode generalPurpose \
+  --throughput-mode bursting \
+  --region $AOK_AWS_REGION \
+  --tags Key=Name,Value=AirflowVolume \
+  --encrypted \
+  --output text \
+  --query "FileSystemId")
+
+printf "Waiting for 10 seconds...\n"
+sleep 10
+
+printf "Creating EFS mount targets in each subnet attached to on-demand nodes...\n"
+for subnet in $(aws eks describe-nodegroup \
+  --cluster-name $AOK_EKS_CLUSTER_NAME \
+  --nodegroup-name ng-on-demand \
+  --region $AOK_AWS_REGION \
+  --output text \
+  --query "nodegroup.subnets"); \
+do (aws efs create-mount-target \
+  --file-system-id $AOK_EFS_FS_ID \
+  --subnet-id $subnet \
+  --security-group $AOK_EFS_SG_ID \
+  --region $AOK_AWS_REGION); \
+done
+
+printf "Creating an EFS access point...\n"
+export AOK_EFS_AP=$(aws efs create-access-point \
+  --file-system-id $AOK_EFS_FS_ID \
+  --posix-user Uid=1000,Gid=1000 \
+  --root-directory "Path=/airflow,CreationInfo={OwnerUid=1000,OwnerGid=1000,Permissions=777}" \
+  --region $AOK_AWS_REGION \
+  --query 'AccessPointId' \
+  --output text)
+部署数据库
+
+printf "Obtaining the list of Private Subnets in Env variables...\n"
+export AOK_PRIVATE_SUBNETS=$(aws eks describe-nodegroup \
+  --cluster-name $AOK_EKS_CLUSTER_NAME \
+  --nodegroup-name ng-on-demand \
+  --region $AOK_AWS_REGION \
+  --output text \
+  --query "nodegroup.subnets" | awk -v OFS="," '{for(i=1;i<=NF;i++)if($i~/subnet/)$i="\"" $i "\"";$1=$1}1')
+
+printf "Creating a DB Subnet group...\n"
+aws rds create-db-subnet-group \
+   --db-subnet-group-name airflow-postgres-subnet \
+   --subnet-ids "[$AOK_PRIVATE_SUBNETS]" \
+   --db-subnet-group-description "Subnet group for Postgres RDS" \
+   --region $AOK_AWS_REGION
+
+printf "Creating the RDS Postgres Instance...\n"
+aws rds create-db-instance \
+  --db-instance-identifier airflow-postgres \
+  --db-instance-class db.m6g.large \
+  --db-name airflow \
+  --db-subnet-group-name airflow-postgres-subnet \
+  --engine postgres \
+  --master-username airflowadmin \
+  --master-user-password supersecretpassword \
+  --allocated-storage 20 \
+  --no-publicly-accessible \
+  --region $AOK_AWS_REGION
+  
+  
+printf "Creating RDS security group...\n"
+export AOK_RDS_SG=$(aws rds describe-db-instances \
+   --db-instance-identifier airflow-postgres \
+   --region $AOK_AWS_REGION \
+   --query "DBInstances[].VpcSecurityGroups[].VpcSecurityGroupId" \
+   --output text)
+
+printf "Authorizing traffic...\n"
+aws ec2 authorize-security-group-ingress \
+  --group-id $AOK_RDS_SG \
+  --cidr $AOK_CIDR_BLOCK \
+  --port 5432 \
+  --protocol tcp \
+  --region $AOK_AWS_REGION
+
+printf "Waiting for 5 minutes...\n"
+sleep 300 
+
+printf "Checking if the RDS Instance is up ....\n"
+aws rds describe-db-instances \
+  --db-instance-identifier airflow-postgres \
+  --region $AOK_AWS_REGION \
+  --query "DBInstances[].DBInstanceStatus"
+
+printf "Creating an RDS endpoint....\n"
+export AOK_RDS_ENDPOINT=$(aws rds describe-db-instances \
+  --db-instance-identifier airflow-postgres \
+  --query 'DBInstances[0].Endpoint.Address' \
+  --region $AOK_AWS_REGION \
+  --output text)
+  
+export AOK_SQL_ALCHEMY_CONN=$(echo -n postgresql://airflowadmin:supersecretpassword@${AOK_RDS_ENDPOINT}:5432/airflow | base64 -w 0)
+
+三、EKS基础配置
+安装Karpenter
+#初始化变量
+export KARPENTER_VERSION=v0.28.1
+export CLUSTER_NAME="EKSdemo"
+export AWS_DEFAULT_REGION="ap-southeast-1"
+export AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+export CLUSTER_ENDPOINT=$(aws eks describe-cluster --name ${CLUSTER_NAME} --query cluster.endpoint --output text)
+echo $KARPENTER_VERSION $CLUSTER_NAME $AWS_DEFAULT_REGION $AWS_ACCOUNT_ID $TEMPOUT
+TEMPOUT=$(mktemp)
+
+#安装instance profile
+curl -fsSL https://raw.githubusercontent.com/aws/karpenter/"${KARPENTER_VERSION}"/website/content/en/preview/getting-started/getting-started-with-karpenter/cloudformation.yaml  > $TEMPOUT \
+&& aws cloudformation deploy \
+  --stack-name "Karpenter-${CLUSTER_NAME}" \
+  --template-file "${TEMPOUT}" \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides "ClusterName=${CLUSTER_NAME}"
+
+
+eksctl create iamidentitymapping \
+  --username system:node:{{EC2PrivateDNSName}} \
+  --cluster "${CLUSTER_NAME}" \
+  --arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/KarpenterNodeRole-${CLUSTER_NAME}" \
+  --group system:bootstrappers \
+  --group system:nodes
+
+
+eksctl create iamserviceaccount \
+  --cluster "${CLUSTER_NAME}" --name karpenter --namespace karpenter \
+  --role-name "${CLUSTER_NAME}-karpenter" \
+  --attach-policy-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:policy/KarpenterControllerPolicy-${CLUSTER_NAME}" \
+  --role-only \
+  --approve
+
+export KARPENTER_IAM_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${CLUSTER_NAME}-karpenter"
+--初次安装需要，否则安装过会提示错误
+
+aws iam create-service-linked-role --aws-service-name spot.amazonaws.com
+
+export SUBNET_IDS=$(aws eks describe-cluster --name $CLUSTER_NAME  --query "cluster.resourcesVpcConfig.subnetIds[]" --output text)
+
+aws ec2 create-tags \
+    --resources $SUBNET_IDS \
+    --tags Key="karpenter.sh/discovery",Value=${CLUSTER_NAME}
+
+#通过helm工具安装karpenter
+helm repo add karpenter https://charts.karpenter.sh/
+helm repo update
+
+helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter --version ${KARPENTER_VERSION} --namespace karpenter --create-namespace \
+  --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=${KARPENTER_IAM_ROLE_ARN} \
+  --set settings.aws.clusterName=${CLUSTER_NAME} \
+  --set settings.aws.defaultInstanceProfile=KarpenterNodeInstanceProfile-${CLUSTER_NAME} \
+  --set settings.aws.interruptionQueueName=${CLUSTER_NAME} \
+  --set controller.resources.requests.cpu=1 \
+  --set controller.resources.requests.memory=1Gi \
+  --set controller.resources.limits.cpu=1 \
+  --set controller.resources.limits.memory=1Gi \
+  --wait
+
+  kubectl get all -n karpenter
+  
+  
+# 部署 provisioner
+cat << EOF > provisioner.yaml
+apiVersion: karpenter.sh/v1alpha5
+kind: Provisioner
+metadata:
+  name: default
+spec:
+  requirements:
+    - key: karpenter.sh/capacity-type
+      operator: In
+      values: ["spot"]
+    - key: node.kubernetes.io/instance-type
+      operator: In
+      values: ["m6i.large", "m6i.xlarge","m5.large","m5.xlarge","c5.large","c5.xlarge","t3.large","t3.medium","t3.xlarge"]
+  limits:
+    resources:
+      cpu: 1000
+  provider:
+    subnetSelector:
+      karpenter.sh/discovery: ${CLUSTER_NAME}
+    securityGroupSelector:
+      kubernetes.io/cluster/${CLUSTER_NAME}: owned
+  ttlSecondsAfterEmpty: 30
+  taints: 
+   - key: apache.airflow/spot
+     effect: "NoSchedule"
+---
+apiVersion: karpenter.k8s.aws/v1alpha1
+kind: AWSNodeTemplate
+metadata:
+  name: default
+spec:
+  subnetSelector:
+    karpenter.sh/discovery: ${CLUSTER_NAME}
+  securityGroupSelector:
+    karpenter.sh/discovery: ${CLUSTER_NAME}
+EOF
+
+--测试karpenter是否OK
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inflate
+  namespace: airflow
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: inflate
+  template:
+    metadata:
+      labels:
+        app: inflate
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: inflate
+          image: public.ecr.aws/eks-distro/kubernetes/pause:3.2
+          resources:
+            requests:
+              cpu: 1
+      tolerations:
+      - key: apache.airflow/spot
+        effect: "NoSchedule"              
+
+EOF
+
+kubectl scale deployment inflate --replicas 20
+kubectl logs -f -n karpenter -l app.kubernetes.io/name=karpenter -c controller
+四、Apache Airflow配置
+namespace.yaml
+cat << EOF > namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: airflow
+EOF
+configmap.yaml
+cat << EOF > configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: airflow-configmap
+  namespace: airflow
+  labels:
+    airflow: configmap
+data:
+  executor: "KubernetesExecutor"
+  airflow.cfg: |
+    [core]
+    executor = KubernetesExecutor
+
+  pod_template_file: "/opt/airflow/pod-creator.yaml"
+  pod-creator.yaml: |
+    kind: Pod
+    metadata:
+      name: airflow-worker
+      namespace: airflow
+    spec:
+      containers: 
+        - name: base 
+          imagePullPolicy: IfNotPresent 
+          image: apache/airflow:2.6.1
+          resources:
+            requests:
+              cpu: 1          
+          env: 
+          - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN 
+            valueFrom:
+              secretKeyRef:
+                name: airflow-secrets
+                key: sql_alchemy_conn
+          - name: AIRFLOW__CORE__EXECUTOR 
+            valueFrom: 
+              configMapKeyRef: 
+                name: airflow-configmap 
+                key: executor 
+          - name: AIRFLOW__KUBERNETES_EXECUTOR__NAMESPACE 
+            value: "airflow" 
+          - name: AIRFLOW__CORE__DAGS_FOLDER 
+            value: "/opt/airflow/dags" 
+          - name: AIRFLOW__KUBERNETES_EXECUTOR__DELETE_WORKER_PODS 
+            value: "True" 
+          - name: AIRFLOW__KUBERNETES__DELETE_WORKER_PODS_ON_FAILURE 
+            value: "True" 
+          volumeMounts: 
+            - name: airflow-efs-volumes
+              mountPath: /opt/airflow/logs 
+            - name: airflow-efs-volumes
+              mountPath: /opt/airflow/dags 
+      restartPolicy: Never 
+      securityContext: 
+        runAsUser: 50000 
+        fsGroup: 50000 
+      serviceAccountName: "airflow" 
+      volumes: 
+        - name: airflow-configmap
+          configMap:
+            name: airflow-configmap 
+        - name: airflow-efs-volumes
+          persistentVolumeClaim: 
+            claimName: airflow-efs-pvc
+      tolerations:
+      - key: apache.airflow/spot
+        effect: "NoSchedule"          
+EOF
+secrets.yaml
+cat << EOF > secrets.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: airflow-secrets
+  namespace: airflow
+type: Opaque
+data:
+  sql_alchemy_conn: XXX #DB的连接信息
+EOF
+EKS存储配置（EFS）
+cat << EOF > AirflowVolumes.yaml
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: efs-sc
+provisioner: efs.csi.aws.com
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: airflow-efs-pv
+spec:
+  capacity:
+    storage: 100Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: efs-sc
+  csi:
+    driver: efs.csi.aws.com
+    volumeHandle: fs-027da1b8fd882b470::fsap-05244c5fcfb38620c
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: airflow-efs-pvc
+  namespace: airflow
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 100Gi  
+EOF
+serviceaccount
+cat << EOF > AirflowServiceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: airflow
+  namespace: airflow
+  annotations: 
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/AirflowK8SRole  
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: airflow
+  name: airflow   
+rules: 
+  - apiGroups: [""] 
+    resources: ["services", "endpoints", "pods"] 
+    verbs: ["get", "list", "create", "delete", "watch", "patch"] 
+  - apiGroups: [""] 
+    resources: ["pods/logs"] 
+    verbs: ["get", "list", "create", "delete", "watch", "patch"] 
+  - apiGroups: [""] 
+    resources: ["pods/exec"] 
+    verbs: ["get", "list", "create", "delete", "watch", "patch"] 
+  - apiGroups: [""] 
+    resources: ["events"] 
+    verbs: ["list"]     
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: airflow
+  namespace: airflow
+subjects:
+  - kind: ServiceAccount
+    name: airflow # Name of the ServiceAccount
+    namespace: airflow
+roleRef:
+  kind: Role # This must be Role or ClusterRole
+  name: airflow # This must match the name of the Role
+                #   or ClusterRole you wish to bind to
+  apiGroup: rbac.authorization.k8s.io
+EOF
+airflow
+cat << EOF > airflow.yaml
+kind: Deployment 
+apiVersion: apps/v1 
+metadata: 
+  name: airflow 
+  namespace: "airflow" 
+spec: 
+  replicas: 1 
+  selector: 
+    matchLabels: 
+      deploy: airflow 
+      name: airflow 
+      component: webserver 
+  template:
+    metadata: 
+      labels: 
+        deploy: airflow 
+        name: airflow 
+        component: webserver 
+    spec: 
+      serviceAccountName: airflow 
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: lifecycle
+                operator: NotIn
+                values:
+                - Ec2Spot      
+      containers: 
+        - name: airflow-scheduler
+          image: 'apache/airflow:2.6.1' 
+          imagePullPolicy: Always 
+          env: 
+            - name: AIRFLOW__KUBERNETES_EXECUTOR__NAMESPACE 
+              value: "airflow" 
+            - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN 
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-secrets
+                  key: sql_alchemy_conn
+            - name: AIRFLOW__CORE__EXECUTOR 
+              valueFrom: 
+                configMapKeyRef: 
+                  name: airflow-configmap
+                  key: executor            
+            - name: AIRFLOW__KUBERNETES_EXECUTOR__POD_TEMPLATE_FILE 
+              valueFrom: 
+                configMapKeyRef: 
+                  name: airflow-configmap 
+                  key: pod_template_file                   
+          volumeMounts: 
+            - name: airflow-configmap
+              mountPath: /opt/airflow/pod-creator.yaml
+              subPath: pod-creator.yaml
+            - name: airflow-configmap
+              mountPath: /opt/airflow/airflow.cfg
+              subPath: airflow.cfg
+            - name: airflow-efs-volumes
+              mountPath: /opt/airflow/dags
+            - name: airflow-efs-volumes
+              mountPath: /opt/airflow/logs                           
+          command: 
+            - airflow 
+          args: 
+            - scheduler 
+        - name: airflow-webserver 
+          env: 
+            - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN 
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-secrets
+                  key: sql_alchemy_conn
+            - name: AIRFLOW__CORE__EXECUTOR 
+              valueFrom: 
+                configMapKeyRef: 
+                  name: airflow-configmap 
+                  key: executor 
+          volumeMounts: 
+            - name: airflow-configmap
+              mountPath: /opt/airflow/pod-creator.yaml
+              subPath: pod-creator.yaml
+            - name: airflow-configmap
+              mountPath: /opt/airflow/airflow.cfg
+              subPath: airflow.cfg
+            - name: airflow-efs-volumes
+              mountPath: /opt/airflow/dags
+            - name: airflow-efs-volumes
+              mountPath: /opt/airflow/logs                  
+          image: 'apache/airflow:2.6.1'
+          imagePullPolicy: Always 
+          ports: 
+            - containerPort: 8080 
+          command: 
+            - airflow 
+          args: 
+            - webserver 
+      restartPolicy: Always 
+      volumes: 
+        - name: airflow-configmap
+          configMap:
+            name: airflow-configmap        
+        - name: airflow-efs-volumes
+          persistentVolumeClaim:
+            claimName: airflow-efs-pvc
+EOF
+Service
+cat << EOF > service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: airflow
+  namespace: airflow
+spec:
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+  type: NodePort
+  selector:
+    name: airflow
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  namespace: airflow
+  name: airflow
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+        - path: /
+          pathType: Prefix
+          backend:
+            service:
+              name: airflow
+              port:
+                number: 80
+                
+EOF
+Apache Airflow管理员用户信息初始化
+airflow users  create --role Admin --username admin --email admin --firstname admin --lastname admin --password ***
+
+五、Apache Airflwo DAG测试
+把.py文件放在对应的EFS挂载目录下，Apache Airflow将自动识别到任务
+example_bash_operator_loop_1_min_001.py
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
+
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': datetime(2023, 7, 1),  # 设置适当的开始时间
+    'retries': 3,
+    'retry_delay': timedelta(minutes=5),
+}
+
+# Define the DAG
+dag = DAG(
+    'example_continuous_looping_job',
+    default_args=default_args,
+    schedule_interval=timedelta(minutes=30),  # 设置较短的时间间隔，例如30分钟
+    catchup=False,
+)
+
+# Define the list of items you want to process in the loop
+items_to_process = ['item1', 'item2', 'item3']
+
+# Define the Python function for waiting
+def wait_for_interval(interval):
+    import time
+    print(f"Waiting for {interval} seconds...")
+    time.sleep(interval)
+    print("Wait completed.")
+
+# Define the task that represents the looping job
+def process_item(item):
+    return BashOperator(
+        task_id=f'process_{item}',
+        bash_command=f'echo "Processing {item}"',
+        dag=dag,
+    )
+
+# Create a list of tasks for each item in the list
+tasks = [process_item(item) for item in items_to_process]
+
+# Add PythonOperator to wait for a specified interval between tasks
+wait_task = PythonOperator(
+    task_id='wait_for_interval',
+    python_callable=wait_for_interval,
+    op_args=[600],  # Specify the interval in seconds (e.g., 600 seconds)
+    dag=dag,
+)
+
+# Set the dependencies for the tasks so that they run sequentially
+for i in range(1, len(tasks)):
+    tasks[i - 1] >> tasks[i]
+
+# Set the wait_task to run after each task
+for task in tasks:
+    task >> wait_task
+
+# Optionally, you can add a final task to indicate the completion of the loop
+final_task = BashOperator(
+    task_id='loop_completed',
+    bash_command='echo "Loop completed"',
+    dag=dag,
+)
+
+# Set the final task to run after all the looping tasks have finished
+wait_task >> final_task
+
+截图
+[图片]
+六、结束语
+1、通过在Amazon EKS上部署Apache Airflow熟悉了EKS集群部署，熟悉了Apache Airlfow的主要配置项，掌握了当excutor是KubernetesExecutor时的最佳配置方式，掌握了利用Karpenter在Amazon EKS上把DAG任务运行EC2 Spot Instance。
+七、参考
+https://www.clearpeaks.com/deploying-apache-airflow-on-a-kubernetes-cluster/
+https://www.clearpeaks.com/running-apache-airflow-workflows-on-a-kubernetes-cluster/
+https://karpenter.sh/v0.28/getting-started/
+https://aws.amazon.com/cn/blogs/containers/running-airflow-workflow-jobs-on-amazon-eks-spot-nodes/
+https://towardsdatascience.com/a-journey-to-airflow-on-kubernetes-472df467f556
+https://github.com/xufanglin/eks-quickstart
+https://kubernetes.io/zh-cn/docs/concepts/scheduling-eviction/taint-and-toleration/
+https://repost.aws/zh-Hans/knowledge-center/eks-persistent-storage
+https://docker-practice.github.io/zh-cn/appendix/debug.html
+https://awslabs.github.io/data-on-eks/docs/bestpractices/eks-best-practices
+https://airflow.apache.org/docs/apache-airflow/2.6.1/administration-and-deployment/kubernetes.html
+https://k8s.iswbm.com/c03/p03_kubernetes-node-and-pod-affinity.html
+https://blog.csdn.net/m0_50434960/article/details/114897200
