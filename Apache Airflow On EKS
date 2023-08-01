@@ -142,7 +142,7 @@ export AOK_RDS_ENDPOINT=$(aws rds describe-db-instances \
   --region $AOK_AWS_REGION \
   --output text)
   
-export AOK_SQL_ALCHEMY_CONN=$(echo -n postgresql://airflowadmin:supersecretpassword@${AOK_RDS_ENDPOINT}:5432/airflow | base64 -w 0)
+export AOK_SQL_ALCHEMY_CONN=$(echo -n postgresql://user:pawsswd@${AOK_RDS_ENDPOINT}:5432/airflow | base64 -w 0)
 
 三、EKS基础配置
 安装Karpenter
